@@ -5,6 +5,8 @@
 #include "graph_lua_proc.h"
 #include "midgard/logging.h"
 #include "midgard/sequence.h"
+#include "mjolnir/conditional_projection.h"
+#include "mjolnir/conditional_syntax.h"
 #include "mjolnir/luatagtransform.h"
 #include "mjolnir/osmaccess.h"
 #include "mjolnir/osmlinguistic.h"
@@ -24,6 +26,9 @@
 #include <osmium/io/xml_input.hpp>
 #endif
 
+#include <array>
+#include <map>
+#include <optional>
 #include <thread>
 #include <utility>
 
@@ -64,6 +69,81 @@ void set_access_restriction_value(OSMAccessRestriction& restriction,
   restriction.set_value(value_setter(found_tilde ? value.substr(0, pos) : value));
   restriction.set_except_destination(found_tilde);
 }
+
+std::optional<ConditionalScope> ordinary_auto_scope(const std::string& key) {
+  if (key == "access:conditional") {
+    return ConditionalScope::kAccess;
+  }
+  if (key == "motor_vehicle:conditional") {
+    return ConditionalScope::kMotorVehicle;
+  }
+  if (key == "motorcar:conditional") {
+    return ConditionalScope::kMotorcar;
+  }
+  return std::nullopt;
+}
+
+bool requires_ordinary_auto_projection(const std::vector<ConditionalProgram>& programs) {
+  for (const auto& program : programs) {
+    const auto parsed = parse_conditional_clauses(program.conditional);
+    if (parsed.ok() && parsed.clauses.size() > 1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::vector<uint64_t>
+encode_canonical_domains(const std::vector<CanonicalTimeDomain>& canonical_domains) {
+  using Interval = std::pair<uint16_t, uint16_t>;
+  std::map<Interval, std::array<uint8_t, 12>> masks;
+  for (const auto& domain : canonical_domains) {
+    masks[{domain.begin_minute, domain.end_minute}][domain.month - 1] |=
+        static_cast<uint8_t>(1u << domain.weekday);
+  }
+
+  std::vector<uint64_t> encoded;
+  for (const auto& interval : masks) {
+    size_t month = 0;
+    while (month < 12) {
+      if (interval.second[month] == 0) {
+        ++month;
+        continue;
+      }
+      const auto begin_month = month;
+      const auto dow = interval.second[month];
+      while (month + 1 < 12 && interval.second[month + 1] == dow) {
+        ++month;
+      }
+      const auto end_month = month;
+
+      TimeDomain td;
+      td.set_type(kYMD);
+      td.set_dow(dow);
+      td.set_begin_hrs(static_cast<uint8_t>(interval.first.first / 60));
+      td.set_begin_mins(static_cast<uint8_t>(interval.first.first % 60));
+      td.set_end_hrs(static_cast<uint8_t>(interval.first.second / 60));
+      td.set_end_mins(static_cast<uint8_t>(interval.first.second % 60));
+      if (begin_month != 0 || end_month != 11) {
+        td.set_begin_month(static_cast<uint8_t>(begin_month + 1));
+        td.set_end_month(static_cast<uint8_t>(end_month + 1));
+      }
+      encoded.push_back(td.td_value());
+      ++month;
+    }
+  }
+  return encoded;
+}
+
+struct ordinary_auto_projection_stats {
+  uint64_t seen = 0;
+  uint64_t projected = 0;
+  uint64_t records = 0;
+  uint64_t malformed = 0;
+  uint64_t unsupported = 0;
+  uint64_t fail_closed = 0;
+  uint64_t silent_drops = 0;
+};
 
 // This class helps to set "culdesac" labels to loop roads correctly.
 // How does it work?
@@ -2388,6 +2468,81 @@ struct graph_parser {
         Way{static_cast<uint64_t>(way.id()), std::move(nodes), std::move(tags), way.changeset()});
   }
 
+  void process_ordinary_auto_projection(const std::vector<ConditionalProgram>& programs) {
+    ++ordinary_auto_projection_stats_.seen;
+
+    const bool forward_relevant = !way_.oneway_reverse();
+    const bool backward_relevant = !way_.oneway();
+    const auto forward = forward_relevant
+                             ? project_ordinary_auto(way_.auto_forward() ? OrdinaryAutoBase::kAllow
+                                                                        : OrdinaryAutoBase::kDeny,
+                                                     programs)
+                             : OrdinaryAutoProjection{};
+    const auto backward = backward_relevant
+                              ? project_ordinary_auto(
+                                    way_.auto_backward() ? OrdinaryAutoBase::kAllow
+                                                        : OrdinaryAutoBase::kDeny,
+                                    programs)
+                              : OrdinaryAutoProjection{};
+
+    const auto failed = [](const OrdinaryAutoProjection& projection, const bool relevant) {
+      return relevant && !projection.ok();
+    };
+    if (failed(forward, forward_relevant) || failed(backward, backward_relevant)) {
+      const auto status = failed(forward, forward_relevant) ? forward.status : backward.status;
+      if (status == ProjectionStatus::kSyntaxError) {
+        ++ordinary_auto_projection_stats_.malformed;
+      } else {
+        ++ordinary_auto_projection_stats_.unsupported;
+      }
+      ++ordinary_auto_projection_stats_.fail_closed;
+      if (forward_relevant) {
+        way_.set_auto_forward(false);
+      }
+      if (backward_relevant) {
+        way_.set_auto_backward(false);
+      }
+      LOG_DEBUG("ordinary_auto_projection way_id=" + std::to_string(osmid_) +
+                " result=fail_closed status=" +
+                std::to_string(static_cast<uint8_t>(status)));
+      return;
+    }
+
+    const auto emit = [this](const OrdinaryAutoProjection& projection,
+                             const AccessRestrictionDirection direction,
+                             const std::vector<uint64_t>& domains) {
+      const auto type = projection.polarity == CanonicalPolarity::kTimedDenied
+                            ? AccessType::kTimedDenied
+                            : AccessType::kTimedAllowed;
+      for (const auto value : domains) {
+        OSMAccessRestriction restriction;
+        restriction.set_type(type);
+        restriction.set_modes(kAutoAccess);
+        restriction.set_value(value);
+        restriction.set_direction(direction);
+        osmdata_.access_restrictions.insert({osmid_, restriction});
+        ++ordinary_auto_projection_stats_.records;
+      }
+    };
+
+    const auto forward_domains =
+        forward_relevant ? encode_canonical_domains(forward.domains) : std::vector<uint64_t>{};
+    const auto backward_domains =
+        backward_relevant ? encode_canonical_domains(backward.domains) : std::vector<uint64_t>{};
+    if (forward_relevant && backward_relevant && forward.polarity == backward.polarity &&
+        forward_domains == backward_domains) {
+      emit(forward, AccessRestrictionDirection::kBoth, forward_domains);
+    } else {
+      if (forward_relevant) {
+        emit(forward, AccessRestrictionDirection::kForward, forward_domains);
+      }
+      if (backward_relevant) {
+        emit(backward, AccessRestrictionDirection::kBackward, backward_domains);
+      }
+    }
+    ++ordinary_auto_projection_stats_.projected;
+  }
+
   void way(const Way& way) {
     changeset(way.changeset_id);
 
@@ -2577,8 +2732,25 @@ struct graph_parser {
 
     way_.set_drive_on_right(true); // default
 
+    std::vector<ConditionalProgram> ordinary_auto_programs;
+    for (const auto& kv : tags) {
+      const auto scope = ordinary_auto_scope(kv.first);
+      if (scope) {
+        ordinary_auto_programs.push_back({*scope, kv.second});
+      }
+    }
+    const bool use_ordinary_auto_projection =
+        requires_ordinary_auto_projection(ordinary_auto_programs);
+
     for (const auto& kv : tags) {
       tag_ = {kv.first, kv.second};
+
+      // Preserve the historical path for supported single-clause conditionals. Multi-clause or
+      // syntactically invalid ordinary-auto programs are projected once, after all static access
+      // and direction tags for this way have been parsed.
+      if (use_ordinary_auto_projection && ordinary_auto_scope(tag_.first)) {
+        continue;
+      }
 
       bool is_lang_pronunciation = false;
       std::size_t found = tag_.first.find(":pronunciation");
@@ -2811,6 +2983,10 @@ struct graph_parser {
           ProcessPronunciationTag(OSMLinguistic::Type::kJunctionName, alphabet);
         }
       }
+    }
+
+    if (use_ordinary_auto_projection) {
+      process_ordinary_auto_projection(ordinary_auto_programs);
     }
 
     if (!use_direction_on_ways_) {
@@ -4943,6 +5119,7 @@ struct graph_parser {
   bool has_surface_ = true;
   bool has_surface_tag_ = true, has_tracktype_tag_ = true;
   OSMAccess osm_access_;
+  ordinary_auto_projection_stats ordinary_auto_projection_stats_;
   std::map<std::pair<uint8_t, uint8_t>, uint32_t> pronunciationMap;
   std::map<std::pair<uint8_t, uint8_t>, uint32_t> langMap;
   bool has_user_tags_ = false, has_pronunciation_tags_ = false;
@@ -5250,6 +5427,15 @@ OSMData PBFGraphParser::ParseWays(const boost::property_tree::ptree& pt,
 
   LOG_INFO("Finished with " + std::to_string(osmdata.osm_way_count) + " routable ways containing " +
            std::to_string(osmdata.osm_way_node_count) + " nodes");
+  LOG_INFO("ordinary_auto_projection seen=" +
+           std::to_string(parser.ordinary_auto_projection_stats_.seen) +
+           " projected=" + std::to_string(parser.ordinary_auto_projection_stats_.projected) +
+           " records=" + std::to_string(parser.ordinary_auto_projection_stats_.records) +
+           " malformed=" + std::to_string(parser.ordinary_auto_projection_stats_.malformed) +
+           " unsupported=" + std::to_string(parser.ordinary_auto_projection_stats_.unsupported) +
+           " fail_closed=" + std::to_string(parser.ordinary_auto_projection_stats_.fail_closed) +
+           " silent_drops=" +
+           std::to_string(parser.ordinary_auto_projection_stats_.silent_drops));
 
   osmdata.max_way_id = parser.last_way_;
 
