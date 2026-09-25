@@ -96,7 +96,7 @@ set(tests aabb2 access_restriction actor admin attributes_controller configurati
   incident_loading worker_nullptr_tiles curl_tilegetter filesystem_utils narrativebuilder util_odin)
 
 if(ENABLE_DATA_TOOLS)
-  list(APPEND tests astar multimodal_astar complexrestriction conditional_syntax countryaccess
+  list(APPEND tests astar multimodal_astar complexrestriction conditional_projection conditional_syntax countryaccess
     graphbuilder graphparser
     graphtilebuilder graphreader hierarchylimits isochrone predictive_traffic idtable mapmatch matrix matrix_bss minbb multipoint_routes
     names node_search reach recover_shortcut refs servicedays shape_attributes signinfo summary urban tar_index
