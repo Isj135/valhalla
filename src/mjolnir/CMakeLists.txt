@@ -30,6 +30,7 @@ set(sources
   areabuilder.cc
   bssbuilder.cc
   complexrestrictionbuilder.cc
+  conditional_syntax.cc
   convert_transit.cc
   countryaccess.cc
   dataquality.cc
