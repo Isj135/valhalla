@@ -1494,13 +1494,29 @@ float distance_along_geometry(const valhalla::DirectionsLeg::Maneuver* prev_mane
   }
 }
 
+enum class VoiceInstructionRole { kAlert, kPre, kPost };
+
+std::string voice_instruction_role(const VoiceInstructionRole role) {
+  switch (role) {
+    case VoiceInstructionRole::kAlert:
+      return "alert";
+    case VoiceInstructionRole::kPre:
+      return "pre";
+    case VoiceInstructionRole::kPost:
+      return "post";
+  }
+  throw std::runtime_error("Unhandled VoiceInstructionRole");
+}
+
 void addVoiceInstruction(const std::string& instruction,
                          double distance_along_geometry,
+                         const VoiceInstructionRole role,
                          json::ArrayPtr& voice_instructions) {
   json::MapPtr voice_instruction = json::map({});
   voice_instruction->emplace("distanceAlongGeometry", json::fixed_t{distance_along_geometry, 1});
   voice_instruction->emplace("announcement", instruction);
   voice_instruction->emplace("ssmlAnnouncement", "<speak>" + instruction + "</speak>");
+  voice_instruction->emplace("valhalla_role", voice_instruction_role(role));
   voice_instructions->emplace_back(std::move(voice_instruction));
 }
 
@@ -1561,7 +1577,7 @@ json::ArrayPtr voice_instructions(const valhalla::DirectionsLeg::Maneuver* prev_
     // This voice_instruction_start is only created once. It is always played, even when
     // the maneuver would otherwise be too short.
     addVoiceInstruction(prev_maneuver->verbal_pre_transition_instruction(), double(distance),
-                        voice_instructions);
+                        VoiceInstructionRole::kPre, voice_instructions);
   } else if (distance_before_verbal_transition_alert_instruction >= 0.0 &&
              distance > distance_before_verbal_transition_alert_instruction +
                             APPROXIMATE_VERBAL_POSTRANSITION_LENGTH &&
@@ -1576,7 +1592,7 @@ json::ArrayPtr voice_instructions(const valhalla::DirectionsLeg::Maneuver* prev_
     // meters to play + the 10 meters after the maneuver start which is added so that the
     // instruction is not played directly on the intersection where the maneuver starts.
     addVoiceInstruction(prev_maneuver->verbal_post_transition_instruction(), double(distance - 10),
-                        voice_instructions);
+                        VoiceInstructionRole::kPost, voice_instructions);
   }
 
   // If there is an alert instruction and we have enough time to play it, we will play it
@@ -1601,7 +1617,7 @@ json::ArrayPtr voice_instructions(const valhalla::DirectionsLeg::Maneuver* prev_
             ->FormVerbalAlertApproachInstruction(distance_km,
                                                  maneuver.verbal_transition_alert_instruction());
     addVoiceInstruction(instruction, distance_before_verbal_transition_alert_instruction,
-                        voice_instructions);
+                        VoiceInstructionRole::kAlert, voice_instructions);
   }
 
   // add pre transition instruction if available
@@ -1614,7 +1630,8 @@ json::ArrayPtr voice_instructions(const valhalla::DirectionsLeg::Maneuver* prev_
       distance_before_verbal_pre_transition_instruction = distance / 4;
     }
     addVoiceInstruction(maneuver.verbal_pre_transition_instruction(),
-                        distance_before_verbal_pre_transition_instruction, voice_instructions);
+                        distance_before_verbal_pre_transition_instruction, VoiceInstructionRole::kPre,
+                        voice_instructions);
   }
 
   return voice_instructions;
@@ -1860,6 +1877,9 @@ json::ArrayPtr serialize_legs(const google::protobuf::RepeatedPtrField<valhalla:
                     osrm_maneuver(maneuver, mnvr_type, modifier, in_brg, out_brg,
                                   shape[maneuver.begin_shape_index()],
                                   (options.directions_type() == DirectionsType::instructions)));
+      if (maneuver.verbal_multi_cue()) {
+        step->emplace("valhalla_verbal_multi_cue", true);
+      }
 
       // Add destinations
       const auto& sign = maneuver.sign();

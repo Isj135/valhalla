@@ -700,6 +700,32 @@ TEST_F(VoiceInstructions, AllVoiceInstructions) {
   EXPECT_EQ(last_instruction.Size(), 0);
 }
 
+TEST_F(VoiceInstructions, ValhallaGuidanceFactsAreAdditive) {
+  auto json = json_request("A", "F");
+  auto steps = json["routes"][0]["legs"][0]["steps"].GetArray();
+
+  ASSERT_EQ(steps[0]["voiceInstructions"].Size(), 2);
+  EXPECT_STREQ(steps[0]["voiceInstructions"][0]["valhalla_role"].GetString(), "pre");
+  EXPECT_STREQ(steps[0]["voiceInstructions"][1]["valhalla_role"].GetString(), "pre");
+
+  ASSERT_EQ(steps[1]["voiceInstructions"].Size(), 3);
+  EXPECT_STREQ(steps[1]["voiceInstructions"][0]["valhalla_role"].GetString(), "post");
+  EXPECT_STREQ(steps[1]["voiceInstructions"][1]["valhalla_role"].GetString(), "alert");
+  EXPECT_STREQ(steps[1]["voiceInstructions"][2]["valhalla_role"].GetString(), "pre");
+
+  for (const auto& step : steps) {
+    for (const auto& voice : step["voiceInstructions"].GetArray()) {
+      EXPECT_TRUE(voice.HasMember("distanceAlongGeometry"));
+      EXPECT_TRUE(voice.HasMember("announcement"));
+      EXPECT_TRUE(voice.HasMember("ssmlAnnouncement"));
+    }
+  }
+
+  EXPECT_TRUE(steps[0].HasMember("valhalla_verbal_multi_cue"));
+  EXPECT_TRUE(steps[0]["valhalla_verbal_multi_cue"].GetBool());
+  EXPECT_FALSE(steps[steps.Size() - 1].HasMember("valhalla_verbal_multi_cue"));
+}
+
 TEST_F(VoiceInstructions, DefaultVoiceLocalePresent) {
   auto json = json_request("A", "F");
   auto routes = json["routes"].GetArray();
