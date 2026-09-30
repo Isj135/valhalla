@@ -52,6 +52,7 @@ struct OrdinaryAutoProjection {
   CanonicalPolarity polarity;
   std::vector<ProjectedClause> clauses;
   std::vector<CanonicalTimeDomain> domains;
+  bool ignored_malformed_more_specific = false;
 
   bool ok() const {
     return status == ProjectionStatus::kProjected;

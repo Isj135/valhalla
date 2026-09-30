@@ -93,19 +93,28 @@ TEST(ConditionalProjection, MostSpecificProgramIsTheOnlyProgramEvaluated) {
   EXPECT_FALSE(active(result, 1, 1, 9));
 }
 
-TEST(ConditionalProjection, DominantMalformedProgramFailsWithoutFallback) {
+TEST(ConditionalProjection, DominantMalformedProgramPreservesValidLessSpecificProgram) {
   const std::vector<ConditionalProgram> via_della_rocca = {
       {ConditionalScope::kMotorVehicle,
        "no @ (Mo-Fr 07:30-10:30); yes @ permit"},
       {ConditionalScope::kMotorcar, "no @ (Mo-Fr 07:30-10:30); permit"},
   };
-  for (const auto base : {OrdinaryAutoBase::kAllow, OrdinaryAutoBase::kDeny}) {
-    const auto result = project_ordinary_auto(base, via_della_rocca);
-    EXPECT_FALSE(result.ok());
-    EXPECT_EQ(result.status, ProjectionStatus::kSyntaxError);
-    EXPECT_TRUE(result.clauses.empty());
-    EXPECT_TRUE(result.domains.empty());
-  }
+  const auto allow = project_ordinary_auto(OrdinaryAutoBase::kAllow, via_della_rocca);
+  ASSERT_TRUE(allow.ok());
+  EXPECT_EQ(allow.selected_scope, ConditionalScope::kMotorVehicle);
+  EXPECT_TRUE(allow.ignored_malformed_more_specific);
+  EXPECT_EQ(allow.polarity, CanonicalPolarity::kTimedDenied);
+  EXPECT_TRUE(active(allow, 1, 1, 9));
+  EXPECT_FALSE(active(allow, 1, 1, 11));
+
+  const auto deny = project_ordinary_auto(OrdinaryAutoBase::kDeny, via_della_rocca);
+  ASSERT_TRUE(deny.ok());
+  EXPECT_EQ(deny.selected_scope, ConditionalScope::kMotorVehicle);
+  EXPECT_TRUE(deny.ignored_malformed_more_specific);
+  EXPECT_EQ(deny.polarity, CanonicalPolarity::kTimedAllowed);
+  EXPECT_FALSE(active(deny, 1, 1, 9));
+  EXPECT_FALSE(active(deny, 1, 1, 11));
+  EXPECT_TRUE(deny.domains.empty());
 }
 
 TEST(ConditionalProjection, LessSpecificMalformedProgramCannotOverrideValidDominantProgram) {
@@ -253,6 +262,7 @@ TEST(ConditionalProjection, QualifiedTurinPbfCensus) {
   size_t occurrences = 0;
   size_t directly_qualified = 0;
   size_t lower_malformed_but_qualified = 0;
+  size_t recovered_dominant_malformed = 0;
   size_t projected = 0;
   size_t fail_closed = 0;
   size_t unknown = 0;
@@ -306,12 +316,12 @@ TEST(ConditionalProjection, QualifiedTurinPbfCensus) {
       }
 
       if (selected_malformed) {
-        if (way.id() != 1479446338 || allow.status != ProjectionStatus::kSyntaxError ||
-            deny.status != ProjectionStatus::kSyntaxError || !allow.clauses.empty() ||
-            !deny.clauses.empty() || !allow.domains.empty() || !deny.domains.empty()) {
+        if (way.id() != 1479446338 || !allow.ok() || !deny.ok() ||
+            !allow.ignored_malformed_more_specific || !deny.ignored_malformed_more_specific) {
           ++unknown;
         } else {
-          ++fail_closed;
+          ++recovered_dominant_malformed;
+          ++projected;
         }
         continue;
       }
@@ -333,10 +343,13 @@ TEST(ConditionalProjection, QualifiedTurinPbfCensus) {
   EXPECT_EQ(way_ids.size(), 672);
   EXPECT_EQ(directly_qualified, 666);
   EXPECT_EQ(lower_malformed_but_qualified, 5);
-  EXPECT_EQ(fail_closed, 1);
-  EXPECT_EQ(projected, 671);
+  EXPECT_EQ(recovered_dominant_malformed, 1);
+  EXPECT_EQ(fail_closed, 0);
+  EXPECT_EQ(projected, 672);
   EXPECT_EQ(unknown, 0);
   EXPECT_EQ(multi_tag_ways, 5);
   EXPECT_TRUE(standalone_malformed_seen);
-  EXPECT_EQ(directly_qualified + lower_malformed_but_qualified + fail_closed + unknown, 672);
+  EXPECT_EQ(directly_qualified + lower_malformed_but_qualified +
+                recovered_dominant_malformed + fail_closed + unknown,
+            672);
 }

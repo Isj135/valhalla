@@ -49,7 +49,7 @@ int specificity(const ConditionalScope scope) {
 }
 
 OrdinaryAutoProjection failure(const ProjectionStatus status) {
-  return {status, ConditionalScope::kUnsupported, CanonicalPolarity::kTimedDenied, {}, {}};
+  return {status, ConditionalScope::kUnsupported, CanonicalPolarity::kTimedDenied, {}, {}, false};
 }
 
 bool is_qualified_temporal_syntax(std::string condition) {
@@ -220,9 +220,31 @@ project_ordinary_auto(const OrdinaryAutoBase base,
     }
   }
 
-  const auto parsed = parse_conditional_clauses(selected->conditional);
+  auto parsed = parse_conditional_clauses(selected->conditional);
+  bool ignored_malformed_more_specific = false;
   if (!parsed.ok()) {
-    return failure(ProjectionStatus::kSyntaxError);
+    const ConditionalProgram* fallback = nullptr;
+    int fallback_specificity = -1;
+    ConditionalParseResult fallback_parsed;
+    for (const auto& program : programs) {
+      const auto rank = specificity(program.scope);
+      if (rank >= selected_specificity || rank <= fallback_specificity) {
+        continue;
+      }
+      auto candidate = parse_conditional_clauses(program.conditional);
+      if (candidate.ok()) {
+        fallback = &program;
+        fallback_specificity = rank;
+        fallback_parsed = std::move(candidate);
+      }
+    }
+    if (fallback == nullptr) {
+      return failure(ProjectionStatus::kSyntaxError);
+    }
+    selected = fallback;
+    selected_specificity = fallback_specificity;
+    parsed = std::move(fallback_parsed);
+    ignored_malformed_more_specific = true;
   }
 
   const bool base_allowed = base == OrdinaryAutoBase::kAllow;
@@ -258,7 +280,7 @@ project_ordinary_auto(const OrdinaryAutoBase base,
   }
   return {ProjectionStatus::kProjected, selected->scope,
           base_allowed ? CanonicalPolarity::kTimedDenied : CanonicalPolarity::kTimedAllowed,
-          std::move(clauses), canonicalize(changed)};
+          std::move(clauses), canonicalize(changed), ignored_malformed_more_specific};
 }
 
 bool canonical_domain_active(const CanonicalTimeDomain& domain,

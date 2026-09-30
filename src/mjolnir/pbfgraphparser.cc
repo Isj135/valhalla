@@ -2508,6 +2508,11 @@ struct graph_parser {
       return;
     }
 
+    if ((forward_relevant && forward.ignored_malformed_more_specific) ||
+        (backward_relevant && backward.ignored_malformed_more_specific)) {
+      ++ordinary_auto_projection_stats_.malformed;
+    }
+
     const auto emit = [this](const OrdinaryAutoProjection& projection,
                              const AccessRestrictionDirection direction,
                              const std::vector<uint64_t>& domains) {

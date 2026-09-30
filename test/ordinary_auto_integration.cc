@@ -154,12 +154,15 @@ TEST(OrdinaryAutoIntegration, TurinPbfParserAndIntermediateRestrictions) {
     const auto restrictions = auto_restrictions(osmdata, id);
     if (id == 1479446338) {
       const auto way = find_way(ways, id);
-      EXPECT_FALSE(way.auto_forward());
+      EXPECT_TRUE(way.auto_forward());
       EXPECT_FALSE(way.auto_backward());
       EXPECT_TRUE(way.taxi_forward());
       EXPECT_TRUE(way.bus_forward());
       EXPECT_FALSE(way.emergency_forward());
-      EXPECT_TRUE(restrictions.empty());
+      ASSERT_EQ(restrictions.size(), 1);
+      expect_weekday_morning(restrictions.front(), kAutoAccess);
+      EXPECT_EQ(restrictions.front().direction(), AccessRestrictionDirection::kForward);
+      ++projected_with_auto_restrictions;
     } else {
       if (restrictions.empty()) {
         ++projected_canonical_noops;
@@ -168,9 +171,9 @@ TEST(OrdinaryAutoIntegration, TurinPbfParserAndIntermediateRestrictions) {
       }
     }
   }
-  EXPECT_EQ(projected_with_auto_restrictions, 656);
+  EXPECT_EQ(projected_with_auto_restrictions, 657);
   EXPECT_EQ(projected_canonical_noops, 15);
-  EXPECT_EQ(projected_with_auto_restrictions + projected_canonical_noops, 671);
+  EXPECT_EQ(projected_with_auto_restrictions + projected_canonical_noops, 672);
 
   for (const auto id : kVanchigliaWays) {
     const auto way = find_way(ways, id);
