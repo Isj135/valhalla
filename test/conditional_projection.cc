@@ -37,14 +37,6 @@ bool active(const OrdinaryAutoProjection& projection,
   return false;
 }
 
-void expect_exact_for_both_bases(const std::string& text) {
-  const auto allow = project(text, OrdinaryAutoBase::kAllow);
-  const auto deny = project(text, OrdinaryAutoBase::kDeny);
-  EXPECT_TRUE(allow.ok()) << text;
-  EXPECT_TRUE(deny.ok()) << text;
-  EXPECT_EQ(allow.polarity, CanonicalPolarity::kTimedDenied);
-  EXPECT_EQ(deny.polarity, CanonicalPolarity::kTimedAllowed);
-}
 
 int scope_rank(const ConditionalScope scope) {
   switch (scope) {
