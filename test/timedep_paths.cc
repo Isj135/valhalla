@@ -1,10 +1,16 @@
+#include "baldr/rapidjson_utils.h"
 #include "loki/worker.h"
+#include "gurka.h"
 #include "test.h"
 #include "thor/unidirectional_astar.h"
 #include "thor/worker.h"
 #include "worker.h"
 
+#include <algorithm>
+#include <limits>
 #include <string>
+#include <stdexcept>
+#include <tuple>
 
 using namespace valhalla;
 using namespace valhalla::thor;
@@ -151,6 +157,454 @@ TEST(TimeDepPaths, test_reverse_max_reserved_labels_count) {
   TimeDepReverseTest time_dep(config);
   time_dep.Clear();
 }
+
+// Frozen expected contract: valhalla-pre-diff-rev2/expected.json, 09 October 2026.
+// These tests inspect diagnostic custody, not an alternative route response.
+namespace {
+using Snapshot = TimeDepForward::ExperimentalChainSnapshot;
+
+auto label_values(const BDEdgeLabel& label) {
+  return std::make_tuple(label.predecessor(), label.edgeid().value, label.endnode().value,
+                         label.mode(), label.use(), label.origin(), label.destination(),
+                         label.shortcut(), label.cost().cost, label.cost().secs,
+                         label.sortcost(), label.path_distance(), label.restriction_idx(),
+                         label.transition_cost().cost, label.transition_cost().secs,
+                         label.opp_edgeid().value, label.not_thru_pruning());
+}
+
+auto snapshot_values(const Snapshot& snapshot) {
+  std::vector<decltype(label_values(BDEdgeLabel{}))> values;
+  for (const auto& step : snapshot.steps)
+    values.push_back(label_values(step.label));
+  return values;
+}
+
+void expect_same_paths(const std::vector<std::vector<PathInfo>>& expected,
+                       const std::vector<std::vector<PathInfo>>& actual) {
+  ASSERT_EQ(expected.size(), actual.size());
+  for (size_t i = 0; i < expected.size(); ++i) {
+    ASSERT_EQ(expected[i].size(), actual[i].size());
+    for (size_t j = 0; j < expected[i].size(); ++j) {
+      const auto& a = expected[i][j];
+      const auto& b = actual[i][j];
+      EXPECT_EQ(a.edgeid, b.edgeid);
+      EXPECT_EQ(a.mode, b.mode);
+      EXPECT_EQ(a.elapsed_cost.cost, b.elapsed_cost.cost);
+      EXPECT_EQ(a.elapsed_cost.secs, b.elapsed_cost.secs);
+      EXPECT_EQ(a.path_distance, b.path_distance);
+      EXPECT_EQ(a.restriction_index, b.restriction_index);
+      EXPECT_EQ(a.transition_cost.cost, b.transition_cost.cost);
+      EXPECT_EQ(a.transition_cost.secs, b.transition_cost.secs);
+      EXPECT_EQ(a.trip_id, b.trip_id);
+      EXPECT_EQ(a.is_shortcut, b.is_shortcut);
+      EXPECT_EQ(a.is_disconnected, b.is_disconnected);
+      EXPECT_EQ(a.start_node_is_recovered, b.start_node_is_recovered);
+    }
+  }
+}
+
+// Manual labels test value custody only: no graph, expansion or costing is traversed.
+class ExperimentalAlgorithm : public TimeDepForward {
+public:
+  Location origin;
+  Location destination;
+
+  static BDEdgeLabel label(uint32_t index, uint32_t predecessor,
+                           Use use = Use::kRoad, bool shortcut = false,
+                           sif::TravelMode mode = sif::TravelMode::kDrive) {
+    DirectedEdge edge;
+    edge.set_endnode(GraphId(100, 0, index + 1));
+    edge.set_use(use);
+    edge.set_length(100);
+    if (shortcut)
+      edge.set_shortcut(1);
+    const float cost = 15 + 20 * index;
+    BDEdgeLabel result(predecessor, GraphId(100, 0, index), &edge,
+                       {cost, cost}, cost, 0, mode, kInvalidRestriction,
+                       true, false, InternalTurn::kNoTurn);
+    result.Update(predecessor, {cost, cost}, cost, {}, 75 + 100 * index,
+                  kInvalidRestriction);
+    if (index == 0)
+      result.set_origin();
+    return result;
+  }
+
+  void seed(size_t count = 2, Use last_use = Use::kRoad) {
+    Clear();
+    origin.Clear();
+    destination.Clear();
+    origin.mutable_ll()->set_lat(0);
+    origin.mutable_ll()->set_lng(0);
+    auto* edge = origin.mutable_correlation()->add_edges();
+    edge->set_graph_id(GraphId(100, 0, 0).value);
+    edge->set_percent_along(.25);
+    edge->mutable_ll()->set_lat(0);
+    edge->mutable_ll()->set_lng(0);
+    destination.mutable_ll()->set_lat(0);
+    destination.mutable_ll()->set_lng(.003);
+    for (uint32_t i = 0; i < count; ++i)
+      edgelabels_.push_back(label(i, i == 0 ? kInvalidLabel : i - 1,
+                                 i + 1 == count ? last_use : Use::kRoad));
+    experimental_candidate_ = static_cast<uint32_t>(count - 1);
+    experimental_arrival_ = {.002, 0};
+    experimental_active_ = true;
+  }
+  const std::vector<BDEdgeLabel>& labels() const { return edgelabels_; }
+  BDEdgeLabel& mutable_label(size_t index) { return edgelabels_.at(index); }
+  uint32_t candidate() const { return experimental_candidate_; }
+  void ferry(bool value) { has_ferry_ = value; }
+};
+
+TEST(ExperimentalChain, ManualValuesAndPartialOriginMetadata) {
+  ExperimentalAlgorithm algorithm;
+  EXPECT_FALSE(algorithm.HasExperimentalChainObserver());
+  algorithm.seed();
+  const auto& readonly = algorithm;
+  auto snapshot = readonly.CopyExperimentalChain(algorithm.origin, algorithm.destination);
+  ASSERT_TRUE(snapshot);
+  ASSERT_EQ(snapshot->steps.size(), 2);
+  EXPECT_EQ(snapshot->steps[0].label_index, 0);
+  EXPECT_EQ(snapshot->steps[1].label_index, 1);
+  EXPECT_EQ(snapshot->steps[0].label.predecessor(), kInvalidLabel);
+  EXPECT_EQ(snapshot->steps[1].label.predecessor(), 0);
+  EXPECT_EQ(snapshot->steps[0].label.cost().secs, 15);
+  EXPECT_EQ(snapshot->steps[1].label.cost().secs, 35);
+  EXPECT_EQ(snapshot->steps[0].label.path_distance(), 75);
+  EXPECT_EQ(snapshot->steps[1].label.path_distance(), 175);
+  EXPECT_EQ(snapshot->origin_edge.percent_along(), .25);
+  EXPECT_EQ(snapshot->origin_edge.graph_id(), GraphId(100, 0, 0).value);
+  EXPECT_EQ(snapshot->steps.back().label.endnode(), GraphId(100, 0, 2));
+  EXPECT_EQ(snapshot->requested_destination.lng(), .003);
+  EXPECT_EQ(snapshot->arrival.lng(), .002);
+  EXPECT_EQ(snapshot->pass, 0);
+}
+
+TEST(ExperimentalChain, ManuallyUpdatedPredecessorUsesLabelIndices) {
+  ExperimentalAlgorithm algorithm;
+  algorithm.seed(3);
+  auto& last = algorithm.mutable_label(2);
+  last.Update(0, {35, 35}, 35, {}, 175, kInvalidRestriction);
+  auto snapshot = algorithm.CopyExperimentalChain(algorithm.origin, algorithm.destination);
+  ASSERT_TRUE(snapshot);
+  ASSERT_EQ(snapshot->steps.size(), 2);
+  EXPECT_EQ(snapshot->steps[0].label_index, 0);
+  EXPECT_EQ(snapshot->steps[1].label_index, 2);
+  EXPECT_EQ(snapshot->steps[1].label.predecessor(), 0);
+}
+
+TEST(ExperimentalChain, ConstCopyDoesNotChangeFerryOrLabels) {
+  for (const bool ferry : {false, true}) {
+    ExperimentalAlgorithm algorithm;
+    algorithm.seed(2, Use::kFerry);
+    algorithm.ferry(ferry);
+    const auto before = algorithm.labels();
+    const auto candidate = algorithm.candidate();
+    const auto& readonly = algorithm;
+    auto snapshot = readonly.CopyExperimentalChain(algorithm.origin, algorithm.destination);
+    ASSERT_TRUE(snapshot);
+    EXPECT_EQ(algorithm.has_ferry(), ferry);
+    EXPECT_EQ(algorithm.candidate(), candidate);
+    ASSERT_EQ(algorithm.labels().size(), before.size());
+    for (size_t i = 0; i < before.size(); ++i)
+      EXPECT_EQ(label_values(algorithm.labels()[i]), label_values(before[i]));
+  }
+}
+
+TEST(ExperimentalChain, RejectsInvalidChainsWithoutWrites) {
+  for (int invalid_case = 0; invalid_case < 9; ++invalid_case) {
+    ExperimentalAlgorithm algorithm;
+    algorithm.seed();
+    switch (invalid_case) {
+      case 0: algorithm.mutable_label(1).Update(99, {35,35}, 35, {}, kInvalidRestriction); break;
+      case 1: algorithm.mutable_label(0).Update(1, {15,15}, 15, {}, kInvalidRestriction); break;
+      case 2: algorithm.mutable_label(0) = ExperimentalAlgorithm::label(3, kInvalidLabel); break;
+      case 3: algorithm.origin.mutable_correlation()->clear_edges(); break;
+      case 4: {
+        const auto duplicate = algorithm.origin.correlation().edges(0);
+        *algorithm.origin.mutable_correlation()->add_edges() = duplicate;
+        break;
+      }
+      case 5: algorithm.mutable_label(1).set_destination(); break;
+      case 6: algorithm.mutable_label(1) = ExperimentalAlgorithm::label(1, 0, Use::kRoad, true); break;
+      case 7: algorithm.mutable_label(1) = ExperimentalAlgorithm::label(1, 0, Use::kTransitConnection); break;
+      case 8: algorithm.mutable_label(1) = ExperimentalAlgorithm::label(1, 0, Use::kRoad, false, sif::TravelMode::kPedestrian); break;
+    }
+    const auto before = algorithm.labels();
+    EXPECT_FALSE(algorithm.CopyExperimentalChain(algorithm.origin, algorithm.destination));
+    for (size_t i = 0; i < before.size(); ++i)
+      EXPECT_EQ(label_values(algorithm.labels()[i]), label_values(before[i]));
+  }
+}
+
+TEST(ExperimentalChain, RejectsNonFiniteOriginFraction) {
+  for (const float fraction : {std::numeric_limits<float>::quiet_NaN(),
+                               std::numeric_limits<float>::infinity(),
+                               -std::numeric_limits<float>::infinity()}) {
+    ExperimentalAlgorithm algorithm;
+    algorithm.seed();
+    algorithm.origin.mutable_correlation()->mutable_edges(0)->set_percent_along(fraction);
+    const auto before = algorithm.labels();
+    const auto candidate = algorithm.candidate();
+    EXPECT_FALSE(algorithm.CopyExperimentalChain(algorithm.origin, algorithm.destination));
+    EXPECT_EQ(algorithm.candidate(), candidate);
+    ASSERT_EQ(algorithm.labels().size(), before.size());
+    for (size_t i = 0; i < before.size(); ++i)
+      EXPECT_EQ(label_values(algorithm.labels()[i]), label_values(before[i]));
+  }
+}
+
+TEST(ExperimentalChain, BoundAndAutonomousCopyAfterClear) {
+  ExperimentalAlgorithm algorithm;
+  algorithm.seed(4096);
+  auto limit = algorithm.CopyExperimentalChain(algorithm.origin, algorithm.destination);
+  ASSERT_TRUE(limit);
+  EXPECT_EQ(limit->steps.size(), 4096);
+  algorithm.seed(4097);
+  EXPECT_FALSE(algorithm.CopyExperimentalChain(algorithm.origin, algorithm.destination));
+  algorithm.seed();
+  auto snapshot = algorithm.CopyExperimentalChain(algorithm.origin, algorithm.destination);
+  ASSERT_TRUE(snapshot);
+  const auto before = snapshot_values(*snapshot);
+  const auto origin = snapshot->origin_edge.SerializeAsString();
+  algorithm.Clear();
+  EXPECT_EQ(algorithm.candidate(), kInvalidLabel);
+  EXPECT_TRUE(algorithm.labels().empty());
+  algorithm.seed(3, Use::kFerry);
+  EXPECT_EQ(snapshot_values(*snapshot), before);
+  EXPECT_EQ(snapshot->origin_edge.SerializeAsString(), origin);
+}
+
+class ExperimentalWorker : public thor_worker_t {
+public:
+  explicit ExperimentalWorker(const boost::property_tree::ptree& config,
+                               const std::shared_ptr<GraphReader>& reader)
+      : thor_worker_t(config, reader) {}
+  void observe(TimeDepForward::experimental_chain_observer_t observer) {
+    timedep_forward.SetExperimentalChainObserver(std::move(observer));
+  }
+  std::vector<std::vector<PathInfo>> run(Api& request) {
+    const auto costing = parse_costing(request);
+    timedep_forward.Clear();
+    return get_path(&timedep_forward, *request.mutable_options()->mutable_locations(0),
+                    *request.mutable_options()->mutable_locations(1), costing, request);
+  }
+  uint32_t pass() const { return mode_costing[static_cast<uint32_t>(mode)]->pass(); }
+  bool ferry() const { return timedep_forward.has_ferry(); }
+  void track(const PathAlgorithm::expansion_callback_t& callback) {
+    timedep_forward.set_track_expansion(callback);
+  }
+  TimeDepForward& algorithm() { return timedep_forward; }
+};
+
+// Real engine over synthetic Gurka tiles; correlations are supplied manually.
+// This bypasses Loki correlation and public HTTP serialization.
+class ExperimentalCustody : public ::testing::Test {
+protected:
+  static gurka::map graph;
+  static void SetUpTestSuite() {
+    const auto layout = gurka::detail::map_to_coordinates("A---B---C D---E", 100);
+    const gurka::ways ways = {
+        {"AB", {{"highway","residential"},{"oneway","yes"}}},
+        {"BC", {{"highway","residential"},{"oneway","yes"}}},
+        {"DE", {{"highway","residential"},{"oneway","yes"}}}};
+    graph = gurka::buildtiles(layout, ways, {}, {},
+                              VALHALLA_BUILD_DIR "test/data/experimental_chain_custody");
+  }
+  static PathEdge correlation(GraphReader& reader, const std::string& way,
+                               const std::string& end, double fraction) {
+    const auto edge = std::get<0>(gurka::findEdge(reader, graph.nodes, way, end));
+    const auto begin = graph.nodes.at(way.substr(0,1));
+    const auto finish = graph.nodes.at(end);
+    PathEdge result;
+    result.set_graph_id(edge.value);
+    result.set_percent_along(fraction);
+    result.mutable_ll()->set_lng(begin.lng() + fraction * (finish.lng()-begin.lng()));
+    result.mutable_ll()->set_lat(begin.lat() + fraction * (finish.lat()-begin.lat()));
+    return result;
+  }
+  static Api request(GraphReader& reader, int kind) {
+    Api request;
+    ParseApi(R"({"locations":[{"lat":0,"lon":0},{"lat":0,"lon":0}],"costing":"auto","date_time":{"type":1,"value":"2026-10-08T10:01"}})", Options::route, request);
+    auto* origin = request.mutable_options()->mutable_locations(0);
+    const auto origin_edge = correlation(reader,"AB","B",.25);
+    *origin->mutable_correlation()->add_edges() = origin_edge;
+    *origin->mutable_ll() = origin_edge.ll();
+    origin->set_date_time("2026-10-08T10:01");
+    auto* destination = request.mutable_options()->mutable_locations(1);
+    const auto ordinary_edge = correlation(reader,"BC","C",1);
+    const auto disconnected_edge = correlation(reader,"DE","E",.5);
+    const auto chosen = kind == 1 ? ordinary_edge : disconnected_edge;
+    *destination->mutable_correlation()->add_edges() = chosen;
+    *destination->mutable_ll() = chosen.ll();
+    if (kind == 2)
+      *destination->mutable_correlation()->add_filtered_edges() = ordinary_edge;
+    return request;
+  }
+};
+gurka::map ExperimentalCustody::graph;
+
+TEST_F(ExperimentalCustody, OrdinaryEquivalenceAndFirstPassCustody) {
+  for (const int kind : {0, 1, 2}) {
+    auto reader_off = std::make_shared<GraphReader>(graph.config.get_child("mjolnir"));
+    auto reader_on = std::make_shared<GraphReader>(graph.config.get_child("mjolnir"));
+    ExperimentalWorker off(graph.config, reader_off), on(graph.config, reader_on);
+    Api before = request(*reader_off,kind);
+    Api observed = request(*reader_on,kind);
+    std::vector<Snapshot> snapshots;
+    using CallbackValue = std::tuple<uint64_t, uint64_t, std::string, int, float,
+                                     uint32_t, float, int, uint8_t, int>;
+    std::vector<CallbackValue> callbacks_off, callbacks_on;
+    auto track = [](auto& sink) {
+      return [&sink](GraphReader&, const GraphId& edge, const GraphId& pred,
+                      const char* algorithm_name, Expansion_EdgeStatus status, float seconds,
+                      uint32_t distance, float cost, Expansion_ExpansionType direction,
+                      uint8_t flow_mask, valhalla::TravelMode travel_mode) {
+        // Reader object identity differs by design; every payload field is retained.
+        sink.emplace_back(edge.value, pred.value, std::string(algorithm_name),
+                          static_cast<int>(status), seconds, distance, cost,
+                          static_cast<int>(direction), flow_mask, static_cast<int>(travel_mode));
+      };
+    };
+    off.track(track(callbacks_off));
+    on.track(track(callbacks_on));
+    on.observe([&](Snapshot&& snapshot) { snapshots.push_back(std::move(snapshot)); });
+    const auto paths_off = off.run(before);
+    const auto paths_on = on.run(observed);
+    expect_same_paths(paths_off,paths_on);
+    EXPECT_EQ(before.SerializeAsString(), observed.SerializeAsString());
+    EXPECT_EQ(off.pass(),on.pass());
+    EXPECT_EQ(off.ferry(),on.ferry());
+    EXPECT_EQ(callbacks_off,callbacks_on);
+    if (kind == 0) {
+      EXPECT_TRUE(paths_on.empty());
+      ASSERT_EQ(snapshots.size(),1);
+      const auto& snapshot = snapshots.front();
+      ASSERT_EQ(snapshot.steps.size(),2);
+      EXPECT_EQ(snapshot.origin_edge.percent_along(),.25);
+      // Independent oracle: stored directed-edge length and the frozen .25 origin.
+      // SetOrigin must actually traverse 75% of AB; manual costs 15/35 are unrelated.
+      const auto ab = gurka::findEdge(*reader_on, graph.nodes, "AB", "B");
+      ASSERT_NE(std::get<1>(ab), nullptr);
+      const auto expected_ab_distance =
+          static_cast<uint32_t>(std::get<1>(ab)->length() * .75f + .5f);
+      EXPECT_EQ(snapshot.steps.front().label.path_distance(), expected_ab_distance);
+      EXPECT_EQ(snapshot.steps.front().label.edgeid(),std::get<0>(gurka::findEdge(*reader_on,graph.nodes,"AB","B")));
+      EXPECT_EQ(snapshot.steps.back().label.edgeid(),std::get<0>(gurka::findEdge(*reader_on,graph.nodes,"BC","C")));
+      EXPECT_EQ(snapshot.steps.front().label.endnode(),gurka::findNode(*reader_on,graph.nodes,"B"));
+      EXPECT_EQ(snapshot.steps.back().label.endnode(),gurka::findNode(*reader_on,graph.nodes,"C"));
+      EXPECT_EQ(snapshot.steps.back().label.predecessor(),snapshot.steps.front().label_index);
+      EXPECT_EQ(snapshot.pass,0);
+      for (const auto& step : snapshot.steps) {
+        EXPECT_FALSE(step.label.destination());
+        EXPECT_FALSE(step.label.shortcut());
+        EXPECT_EQ(step.label.mode(),sif::TravelMode::kDrive);
+        const auto predecessor = step.label.predecessor() == kInvalidLabel
+                                     ? GraphId{}.value
+                                     : snapshot.steps.front().label.edgeid().value;
+        const auto event = std::find_if(callbacks_on.begin(), callbacks_on.end(),
+            [&](const CallbackValue& value) {
+              return std::get<0>(value) == step.label.edgeid().value &&
+                     std::get<1>(value) == predecessor &&
+                     std::get<3>(value) == static_cast<int>(Expansion_EdgeStatus_settled) &&
+                     std::get<7>(value) == static_cast<int>(Expansion_ExpansionType_forward);
+            });
+        EXPECT_NE(event, callbacks_on.end());
+      }
+    } else {
+      EXPECT_FALSE(paths_on.empty());
+      EXPECT_TRUE(snapshots.empty());
+      EXPECT_EQ(on.pass(),kind == 2 ? 1 : 0);
+    }
+  }
+}
+
+TEST_F(ExperimentalCustody, ResetCleanupAndInterruptionDoNotPublishStaleData) {
+  auto reader = std::make_shared<GraphReader>(graph.config.get_child("mjolnir"));
+  ExperimentalWorker worker(graph.config, reader);
+  std::vector<Snapshot> snapshots;
+  worker.observe([&](Snapshot&& value) { snapshots.push_back(std::move(value)); });
+  auto fail = request(*reader,0);
+  EXPECT_TRUE(worker.run(fail).empty());
+  ASSERT_EQ(snapshots.size(),1);
+  const auto frozen = snapshot_values(snapshots.front());
+  worker.cleanup(); // Assert before the next run/Clear.
+  EXPECT_FALSE(worker.algorithm().CopyExperimentalChain(
+      fail.options().locations(0), fail.options().locations(1)));
+  auto success = request(*reader,1);
+  EXPECT_FALSE(worker.run(success).empty());
+  EXPECT_EQ(snapshots.size(),1);
+  EXPECT_EQ(snapshot_values(snapshots.front()),frozen);
+  worker.cleanup(); // Assert before the next run/Clear.
+  EXPECT_FALSE(worker.algorithm().CopyExperimentalChain(
+      success.options().locations(0), success.options().locations(1)));
+  bool interrupted = false;
+  worker.track([&](GraphReader&, const GraphId&, const GraphId&, const char*,
+                    Expansion_EdgeStatus status, float, uint32_t, float,
+                    Expansion_ExpansionType, uint8_t, valhalla::TravelMode) {
+    if (status == Expansion_EdgeStatus_settled) {
+      interrupted = true;
+      throw std::runtime_error("fixture interruption");
+    }
+  });
+  auto next = request(*reader,0);
+  EXPECT_THROW(worker.run(next),std::runtime_error);
+  EXPECT_TRUE(interrupted);
+  EXPECT_EQ(snapshots.size(),1);
+  worker.cleanup(); // Assert before the next run/Clear.
+  EXPECT_FALSE(worker.algorithm().CopyExperimentalChain(
+      next.options().locations(0), next.options().locations(1)));
+  worker.track({});
+  auto clean = request(*reader,1);
+  EXPECT_FALSE(worker.run(clean).empty());
+  EXPECT_EQ(snapshots.size(),1);
+}
+
+TEST_F(ExperimentalCustody, ObserverFailureCannotChangeOrdinaryFailure) {
+  auto reader = std::make_shared<GraphReader>(graph.config.get_child("mjolnir"));
+  ExperimentalWorker worker(graph.config,reader);
+  unsigned calls = 0;
+  worker.observe([&](Snapshot&&) { ++calls; throw std::runtime_error("observer"); });
+  auto fail = request(*reader,0);
+  EXPECT_NO_THROW(EXPECT_TRUE(worker.run(fail).empty()));
+  EXPECT_EQ(calls,1);
+}
+
+TEST_F(ExperimentalCustody, ExcludedProfilesHaveNoCandidate) {
+  auto reader = std::make_shared<GraphReader>(graph.config.get_child("mjolnir"));
+  unsigned calls = 0;
+  TimeDepForward algorithm;
+  algorithm.SetExperimentalChainObserver([&](Snapshot&&) { ++calls; });
+  for (int excluded = 0; excluded < 2; ++excluded) {
+    auto api = request(*reader,0);
+    if (excluded == 0) {
+      api.mutable_options()->set_costing_type(Costing::pedestrian);
+      rapidjson::Document costing_options;
+      costing_options.SetObject();
+      sif::ParseCosting(costing_options, "/costing_options", *api.mutable_options(),
+                       *api.mutable_info()->mutable_warnings());
+    } else
+      api.mutable_options()->mutable_locations(0)->clear_date_time();
+    sif::TravelMode mode;
+    auto costs = CostFactory().CreateModeCosting(api.options(),mode);
+    algorithm.Clear();
+    auto origin = api.options().locations(0), destination = api.options().locations(1);
+    algorithm.GetBestPath(origin,destination,*reader,costs,mode,api.options());
+    EXPECT_FALSE(algorithm.CopyExperimentalChain(origin,destination));
+  }
+  TimeDepReverse reverse;
+  unsigned reverse_calls = 0;
+  reverse.SetExperimentalChainObserver([&](TimeDepReverse::ExperimentalChainSnapshot&&) { ++reverse_calls; });
+  auto api = request(*reader,0);
+  auto origin = api.options().locations(0), destination = api.options().locations(1);
+  destination.set_date_time("2026-10-08T10:01");
+  sif::TravelMode mode;
+  auto costs = CostFactory().CreateModeCosting(api.options(),mode);
+  reverse.GetBestPath(origin,destination,*reader,costs,mode,api.options());
+  EXPECT_FALSE(reverse.CopyExperimentalChain(origin,destination));
+  EXPECT_EQ(calls,0);
+  EXPECT_EQ(reverse_calls,0);
+}
+} // namespace
 
 int main(int argc, char* argv[]) {
   // logging::Configure({{"type", ""}}); // silence logs

@@ -318,6 +318,17 @@ std::vector<std::vector<thor::PathInfo>> thor_worker_t::get_path(PathAlgorithm* 
   cost->set_pass(0);
   auto paths = path_algorithm->GetBestPath(origin, destination, *reader, mode_costing, mode, options);
 
+  // One owned first-pass snapshot, before Clear and before correlations are merged.
+  std::optional<TimeDepForward::ExperimentalChainSnapshot> experimental_chain;
+  if (paths.empty() && options.costing_type() == Costing::auto_ && path_algorithm == &timedep_forward &&
+      timedep_forward.HasExperimentalChainObserver()) {
+    try {
+      experimental_chain = timedep_forward.CopyExperimentalChain(origin, destination);
+    } catch (...) {
+      // Allocation/diagnostic failure must not alter the ordinary two-pass route.
+    }
+  }
+
   // Check if we should run a second pass pedestrian route with different A*
   // (to look for better routes where a ferry is taken)
   // TODO(nils): how would a second pass find a better route, if it changes nothing ferry-related?
@@ -356,6 +367,8 @@ std::vector<std::vector<thor::PathInfo>> thor_worker_t::get_path(PathAlgorithm* 
     }
   }
 
+  if (paths.empty() && experimental_chain)
+    timedep_forward.PublishExperimentalChain(std::move(*experimental_chain));
   return paths;
 }
 

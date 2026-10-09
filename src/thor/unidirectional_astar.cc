@@ -6,6 +6,8 @@
 #include <boost/property_tree/ptree.hpp>
 
 #include <algorithm>
+#include <cmath>
+#include <unordered_set>
 
 using namespace valhalla::baldr;
 using namespace valhalla::sif;
@@ -41,6 +43,8 @@ void UnidirectionalAStar<expansion_direction, FORWARD>::Clear() {
     edgelabels_.resize(reservation);
     edgelabels_.shrink_to_fit();
   }
+  experimental_candidate_ = kInvalidLabel;
+  experimental_active_ = false;
   edgelabels_.clear();
   destinations_.clear();
   adjacencylist_.clear();
@@ -396,6 +400,96 @@ inline bool UnidirectionalAStar<expansion_direction, FORWARD>::ExpandInner(
   return added;
 }
 
+template <const ExpansionType expansion_direction, const bool FORWARD>
+void UnidirectionalAStar<expansion_direction, FORWARD>::ObserveExperimentalSettled(
+    uint32_t index, GraphReader& reader, const midgard::PointLL& destination) noexcept {
+  if (!experimental_active_ || index >= edgelabels_.size())
+    return;
+  try {
+    const auto& label = edgelabels_[index];
+    if (label.destination() || label.shortcut() || label.mode() != sif::TravelMode::kDrive ||
+        label.use() >= Use::kRail || !label.endnode().is_valid())
+      return;
+    const auto tile = reader.GetGraphTile(label.endnode());
+    if (!tile)
+      return;
+    const auto arrival = tile->get_node_ll(label.endnode());
+    const auto distance = arrival.Distance(destination);
+    if (!std::isfinite(distance))
+      return;
+    const bool better = experimental_candidate_ == kInvalidLabel ||
+                        distance < experimental_distance_ ||
+                        (distance == experimental_distance_ &&
+                         (label.cost().cost < edgelabels_[experimental_candidate_].cost().cost ||
+                          (label.cost().cost == edgelabels_[experimental_candidate_].cost().cost &&
+                           label.edgeid().value < edgelabels_[experimental_candidate_].edgeid().value)));
+    if (better) {
+      experimental_candidate_ = index;
+      experimental_arrival_ = arrival;
+      experimental_distance_ = distance;
+    }
+  } catch (...) {
+    experimental_candidate_ = kInvalidLabel;
+    experimental_active_ = false;
+  }
+}
+
+template <const ExpansionType expansion_direction, const bool FORWARD>
+std::optional<typename UnidirectionalAStar<expansion_direction, FORWARD>::ExperimentalChainSnapshot>
+UnidirectionalAStar<expansion_direction, FORWARD>::CopyExperimentalChain(
+    const valhalla::Location& origin, const valhalla::Location& destination) const {
+  if (!FORWARD || !experimental_active_ || experimental_candidate_ == kInvalidLabel)
+    return std::nullopt;
+  ExperimentalChainSnapshot snapshot;
+  snapshot.requested_destination = {destination.ll().lng(), destination.ll().lat()};
+  snapshot.arrival = experimental_arrival_;
+  std::unordered_set<uint32_t> seen;
+  for (auto index = experimental_candidate_; index != kInvalidLabel;
+       index = edgelabels_[index].predecessor()) {
+    if (index >= edgelabels_.size() || snapshot.steps.size() == kExperimentalChainLimit ||
+        !seen.insert(index).second)
+      return std::nullopt;
+    const auto& label = edgelabels_[index];
+    if (!label.edgeid().is_valid() || !label.endnode().is_valid() || label.destination() ||
+        label.shortcut() || label.mode() != sif::TravelMode::kDrive || label.use() >= Use::kRail)
+      return std::nullopt;
+    snapshot.steps.push_back({index, label});
+  }
+  if (snapshot.steps.empty() || !snapshot.steps.back().label.origin())
+    return std::nullopt;
+  const auto root_edge = snapshot.steps.back().label.edgeid();
+  const valhalla::PathEdge* root_correlation = nullptr;
+  for (const auto& edge : origin.correlation().edges()) {
+    if (edge.graph_id() == root_edge.value) {
+      if (root_correlation)
+        return std::nullopt;
+      root_correlation = &edge;
+    }
+  }
+  if (!root_correlation || !std::isfinite(root_correlation->percent_along()) ||
+      root_correlation->percent_along() < 0 ||
+      root_correlation->percent_along() > 1)
+    return std::nullopt;
+  const midgard::PointLL root_ll(root_correlation->ll().lng(), root_correlation->ll().lat());
+  if (!(snapshot.arrival.Distance(snapshot.requested_destination) <
+        root_ll.Distance(snapshot.requested_destination)))
+    return std::nullopt;
+  snapshot.origin_edge = *root_correlation;
+  std::reverse(snapshot.steps.begin(), snapshot.steps.end());
+  return snapshot;
+}
+
+template void UnidirectionalAStar<ExpansionType::forward>::ObserveExperimentalSettled(
+    uint32_t, GraphReader&, const midgard::PointLL&) noexcept;
+template void UnidirectionalAStar<ExpansionType::reverse>::ObserveExperimentalSettled(
+    uint32_t, GraphReader&, const midgard::PointLL&) noexcept;
+template std::optional<UnidirectionalAStar<ExpansionType::forward>::ExperimentalChainSnapshot>
+UnidirectionalAStar<ExpansionType::forward>::CopyExperimentalChain(
+    const valhalla::Location&, const valhalla::Location&) const;
+template std::optional<UnidirectionalAStar<ExpansionType::reverse>::ExperimentalChainSnapshot>
+UnidirectionalAStar<ExpansionType::reverse>::CopyExperimentalChain(
+    const valhalla::Location&, const valhalla::Location&) const;
+
 // Form the path from the adjacency list in the _forward_ direction
 template <>
 std::vector<PathInfo> UnidirectionalAStar<ExpansionType::forward>::FormPath(const uint32_t dest) {
@@ -479,7 +573,12 @@ std::vector<std::vector<PathInfo>> UnidirectionalAStar<expansion_direction, FORW
     GraphReader& graphreader,
     const sif::mode_costing_t& mode_costing,
     const travel_mode_t mode,
-    const Options& /*options*/) {
+    const Options& options) {
+  experimental_candidate_ = kInvalidLabel;
+  experimental_active_ = FORWARD && HasExperimentalChainObserver() &&
+                         options.costing_type() == Costing::auto_ &&
+                         !origin.date_time().empty() &&
+                         mode_costing[static_cast<uint32_t>(mode)]->pass() == 0;
   // Set the mode and costing
   mode_ = mode;
   costing_ = mode_costing[static_cast<uint32_t>(mode_)];
@@ -563,6 +662,11 @@ std::vector<std::vector<PathInfo>> UnidirectionalAStar<expansion_direction, FORW
     if (!pred.origin()) {
       edgestatus_.Update(pred.edgeid(), EdgeSet::kPermanent);
     }
+
+    // Experimental observer sees only a popped, non-destination forward label.
+    if (experimental_active_)
+      ObserveExperimentalSettled(predindex, graphreader,
+                                 {destination.ll().lng(), destination.ll().lat()});
 
     // setting this edge as settled
     if (expansion_callback_) {

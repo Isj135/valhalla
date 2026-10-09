@@ -14,6 +14,8 @@
 #include <boost/property_tree/ptree.hpp>
 
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -59,6 +61,42 @@ public:
    * Clear the temporary information generated during path construction.
    */
   void Clear() override;
+
+  // Experimental diagnostic values only. No pointers to labels, tiles or correlations.
+  struct ExperimentalChainStep {
+    uint32_t label_index;
+    sif::BDEdgeLabel label;
+  };
+  struct ExperimentalChainSnapshot {
+    std::vector<ExperimentalChainStep> steps;
+    valhalla::PathEdge origin_edge;
+    midgard::PointLL requested_destination;
+    midgard::PointLL arrival;
+    uint32_t pass = 0;
+  };
+  static constexpr size_t kExperimentalChainLimit = 4096;
+  using experimental_chain_observer_t = std::function<void(ExperimentalChainSnapshot&&)>;
+
+  // Empty by default; no HTTP/configuration option enables this experiment.
+  void SetExperimentalChainObserver(experimental_chain_observer_t observer) {
+    experimental_chain_observer_ = std::move(observer);
+    experimental_candidate_ = baldr::kInvalidLabel;
+    experimental_active_ = false;
+  }
+  bool HasExperimentalChainObserver() const {
+    return static_cast<bool>(experimental_chain_observer_);
+  }
+  std::optional<ExperimentalChainSnapshot>
+  CopyExperimentalChain(const valhalla::Location& origin,
+                        const valhalla::Location& destination) const;
+  void PublishExperimentalChain(ExperimentalChainSnapshot&& snapshot) noexcept {
+    try {
+      if (experimental_chain_observer_)
+        experimental_chain_observer_(std::move(snapshot));
+    } catch (...) {
+      // A diagnostic consumer must not change an ordinary route result or error.
+    }
+  }
 
   /**
    * Returns the name of the algorithm
@@ -155,6 +193,16 @@ protected:
    *          destination - along with travel modes and elapsed time.
    */
   std::vector<PathInfo> FormPath(const uint32_t dest);
+
+  // Called only from the settled branch; it never changes labels, queue or costing.
+  void ObserveExperimentalSettled(uint32_t index,
+                                  baldr::GraphReader& reader,
+                                  const midgard::PointLL& destination) noexcept;
+  experimental_chain_observer_t experimental_chain_observer_;
+  uint32_t experimental_candidate_ = baldr::kInvalidLabel;
+  midgard::PointLL experimental_arrival_;
+  double experimental_distance_ = 0;
+  bool experimental_active_ = false;
 
   sif::TravelMode mode_; // Current travel mode
   uint8_t travel_type_;  // Current travel type
