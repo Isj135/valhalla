@@ -6,7 +6,11 @@
 #include "thor/worker.h"
 #include "worker.h"
 
+#include <boost/property_tree/json_parser.hpp>
+#include <cmath>
 #include <algorithm>
+#include <iomanip>
+#include <iostream>
 #include <limits>
 #include <string>
 #include <stdexcept>
@@ -604,6 +608,174 @@ TEST_F(ExperimentalCustody, ExcludedProfilesHaveNoCandidate) {
   EXPECT_EQ(calls,0);
   EXPECT_EQ(reverse_calls,0);
 }
+
+// Offline Torino custody gate: real Loki correlations, no HTTP or route serialization.
+class TorinoCustodyWorker : public ExperimentalWorker {
+public:
+  using ExperimentalWorker::ExperimentalWorker;
+  std::vector<std::vector<PathInfo>> run_correlated(Api& api) {
+    adjust_locations(api);
+    const auto costing = parse_costing(api);
+    auto& origin = *api.mutable_options()->mutable_locations(0);
+    auto& destination = *api.mutable_options()->mutable_locations(1);
+    auto* selected = get_path_algorithm(costing, origin, destination, api);
+    if (selected != &timedep_forward)
+      throw std::runtime_error("Torino gate: ordinary selector did not choose TimeDepForward");
+    return get_path(selected, origin, destination, costing, api);
+  }
+};
+
+// Opt-in fixture only: disabled in unfiltered runs; explicitly filtered for the Gate.
+TEST(TorinoCustody, DISABLED_PapacinoFrozenCases) {
+  boost::property_tree::ptree config;
+  boost::property_tree::read_json(
+      "C:/Users/renat/Documents/Lumoflutter/valhalla_phase2a_bench/valhalla.json", config);
+  for (const auto* key : {"tile_extract", "traffic_extract", "tile_url", "incident_log",
+                          "incident_tile_dir", "landmarks"})
+    config.get_child("mjolnir").erase(key);
+  config.put("logging.type", "std_out");
+  config.get_child("logging").erase("file_name");
+  using Event = std::tuple<uint64_t, uint64_t, std::string, int, float,
+                           uint32_t, float, int, uint8_t, int>;
+  const auto track = [](std::vector<Event>& events) {
+    return [&events](GraphReader&, const GraphId& edge, const GraphId& pred,
+                     const char* name, Expansion_EdgeStatus status, float seconds,
+                     uint32_t distance, float cost, Expansion_ExpansionType direction,
+                     uint8_t flow, valhalla::TravelMode mode) {
+      events.emplace_back(edge.value, pred.value, std::string(name), int(status), seconds,
+                          distance, cost, int(direction), flow, int(mode));
+    };
+  };
+  struct Case { const char* time; bool historical_arrival; bool ordinary_success; };
+  for (const auto& test : {Case{"06:30", false, true}, Case{"10:01", false, false},
+                           Case{"11:00", false, true}, Case{"10:01", true, true}}) {
+    SCOPED_TRACE(std::string(test.time) + (test.historical_arrival ? " arrival" : " Papacino"));
+    const double lat = test.historical_arrival ? 45.0678875 : 45.0687289;
+    const double lon = test.historical_arrival ? 7.672596100000001 : 7.6720592;
+    const std::string input = std::string(R"({"locations":[{"lat":45.0673126,"lon":7.7012488},{"lat":)") +
+        (test.historical_arrival ? "45.0678875,\"lon\":7.672596100000001" :
+                                  "45.0687289,\"lon\":7.6720592") +
+        R"(}],"costing":"auto","costing_options":{"auto":{}},"date_time":{"type":1,"value":"2026-10-08T)" +
+        test.time + R"("},"language":"it-IT","units":"kilometers","shape_format":"polyline6"})";
+    auto reader_off = std::make_shared<GraphReader>(config.get_child("mjolnir"));
+    auto reader_on = std::make_shared<GraphReader>(config.get_child("mjolnir"));
+    loki_worker_t loki(config, reader_off);
+    Api correlated;
+    ParseApi(input, Options::route, correlated);
+    loki.route(correlated);
+    loki.cleanup();
+    ASSERT_EQ(correlated.options().locations_size(), 2);
+    ASSERT_FALSE(correlated.options().locations(0).correlation().edges().empty());
+    ASSERT_FALSE(correlated.options().locations(1).correlation().edges().empty());
+    ASSERT_EQ(correlated.options().locations(0).date_time(),
+              std::string("2026-10-08T") + test.time);
+    Api off_api = correlated, on_api = correlated;
+    TorinoCustodyWorker off(config, reader_off), on(config, reader_on);
+    std::vector<Event> off_events, on_events;
+    std::vector<Snapshot> snapshots;
+    off.track(track(off_events)); on.track(track(on_events));
+    on.observe([&](Snapshot&& value) { snapshots.push_back(std::move(value)); });
+    const auto off_paths = off.run_correlated(off_api);
+    const auto on_paths = on.run_correlated(on_api);
+    ASSERT_EQ(!off_paths.empty(), test.ordinary_success);
+    expect_same_paths(off_paths, on_paths);
+    ASSERT_FALSE(HasFailure());
+    ASSERT_EQ(off_events, on_events);
+    ASSERT_EQ(off.pass(), on.pass());
+    ASSERT_EQ(off.ferry(), on.ferry());
+    ASSERT_EQ(off.algorithm().not_thru_pruning(), on.algorithm().not_thru_pruning());
+    ASSERT_FALSE(off.algorithm().HasExperimentalChainObserver());
+    ASSERT_TRUE(on.algorithm().HasExperimentalChainObserver());
+    ASSERT_EQ(off_api.options().SerializeAsString(), on_api.options().SerializeAsString());
+    ASSERT_EQ(off_api.info().warnings_size(), on_api.info().warnings_size());
+    for (int i = 0; i < off_api.info().warnings_size(); ++i)
+      ASSERT_EQ(off_api.info().warnings(i).SerializeAsString(), on_api.info().warnings(i).SerializeAsString());
+    ASSERT_DOUBLE_EQ(on_api.options().locations(1).ll().lat(), lat);
+    ASSERT_DOUBLE_EQ(on_api.options().locations(1).ll().lng(), lon);
+    if (test.ordinary_success) {
+      ASSERT_TRUE(snapshots.empty());
+    } else {
+      ASSERT_EQ(on.pass(), 1);
+      ASSERT_EQ(snapshots.size(), 1);
+      const auto& snapshot = snapshots.front();
+      ASSERT_FALSE(snapshot.steps.empty());
+      ASSERT_LE(snapshot.steps.size(), TimeDepForward::kExperimentalChainLimit);
+      ASSERT_EQ(snapshot.pass, 0);
+      ASSERT_DOUBLE_EQ(snapshot.requested_destination.lat(), lat);
+      ASSERT_DOUBLE_EQ(snapshot.requested_destination.lng(), lon);
+      ASSERT_EQ(snapshot.origin_edge.graph_id(), snapshot.steps.front().label.edgeid().value);
+      ASSERT_TRUE(std::isfinite(snapshot.origin_edge.percent_along()));
+      ASSERT_GE(snapshot.origin_edge.percent_along(), 0);
+      ASSERT_LE(snapshot.origin_edge.percent_along(), 1);
+      ASSERT_TRUE(snapshot.steps.front().label.origin());
+      ASSERT_EQ(snapshot.steps.front().label.predecessor(), kInvalidLabel);
+      const auto& roots = on_api.options().locations(0).correlation().edges();
+      const auto root = std::find_if(roots.begin(), roots.end(), [&](const PathEdge& e) {
+        return e.graph_id() == snapshot.origin_edge.graph_id();
+      });
+      ASSERT_NE(root, roots.end());
+      ASSERT_EQ(root->SerializeAsString(), snapshot.origin_edge.SerializeAsString());
+      for (size_t i = 0; i < snapshot.steps.size(); ++i) {
+        const auto& step = snapshot.steps[i];
+        ASSERT_EQ(step.label.mode(), sif::TravelMode::kDrive);
+        ASSERT_FALSE(step.label.destination());
+        ASSERT_FALSE(step.label.shortcut());
+        if (i) ASSERT_EQ(step.label.predecessor(), snapshot.steps[i-1].label_index);
+        const auto event = std::find_if(on_events.begin(), on_events.end(), [&](const Event& e) {
+          return std::get<0>(e) == step.label.edgeid().value &&
+                 std::get<1>(e) == (i ? snapshot.steps[i-1].label.edgeid().value : GraphId{}.value) &&
+                 std::get<3>(e) == int(Expansion_EdgeStatus_settled) &&
+                 std::get<7>(e) == int(Expansion_ExpansionType_forward);
+        });
+        ASSERT_NE(event, on_events.end());
+        const auto tile = reader_on->GetGraphTile(step.label.edgeid());
+        ASSERT_TRUE(tile);
+        ASSERT_EQ(tile->directededge(step.label.edgeid())->endnode(), step.label.endnode());
+      }
+      const auto tile = reader_on->GetGraphTile(snapshot.steps.back().label.endnode());
+      ASSERT_TRUE(tile);
+      ASSERT_EQ(snapshot.arrival, tile->get_node_ll(snapshot.steps.back().label.endnode()));
+    }
+    std::cout << std::setprecision(15) << "TORINO_CASE " << test.time << " historical_arrival=" << test.historical_arrival
+              << " ordinary_success=" << !on_paths.empty() << " pass=" << on.pass()
+              << " callbacks=" << on_events.size() << " snapshots=" << snapshots.size() << std::endl;
+    for (const auto& s : snapshots)
+      std::cout << "TORINO_SNAPSHOT pass=" << s.pass << " labels=" << s.steps.size()
+                << " arrival=" << s.arrival.lat() << "," << s.arrival.lng() << std::endl;
+    for (const auto& s : snapshots) {
+      std::cout << "TORINO_ORIGIN edge=" << s.origin_edge.graph_id()
+                << " fraction=" << s.origin_edge.percent_along() << std::endl;
+      for (const auto& step : s.steps)
+        std::cout << "TORINO_LABEL index=" << step.label_index
+                  << " predecessor=" << step.label.predecessor()
+                  << " edge=" << step.label.edgeid().value
+                  << " endnode=" << step.label.endnode().value
+                  << " cost=" << step.label.cost().cost
+                  << " seconds=" << step.label.cost().secs << std::endl;
+    }
+    std::vector<decltype(snapshot_values(Snapshot{}))> values;
+    std::vector<std::string> origins;
+    std::vector<std::tuple<double,double,double,double,uint32_t>> metadata;
+    for (const auto& s : snapshots)
+      metadata.emplace_back(s.arrival.lat(), s.arrival.lng(), s.requested_destination.lat(),
+                            s.requested_destination.lng(), s.pass);
+    for (const auto& s : snapshots) { values.push_back(snapshot_values(s)); origins.push_back(s.origin_edge.SerializeAsString()); }
+    off.cleanup(); on.cleanup(); // Inspect immediately, before another Clear can mask cleanup.
+    ASSERT_FALSE(on.algorithm().CopyExperimentalChain(on_api.options().locations(0), on_api.options().locations(1)));
+    ASSERT_FALSE(off.algorithm().CopyExperimentalChain(off_api.options().locations(0), off_api.options().locations(1)));
+    ASSERT_EQ(off.pass(), on.pass()); ASSERT_EQ(off.ferry(), on.ferry());
+    ASSERT_EQ(off.algorithm().not_thru_pruning(), on.algorithm().not_thru_pruning());
+    on.algorithm().Clear();
+    for (size_t i = 0; i < snapshots.size(); ++i) {
+      const auto& s = snapshots[i];
+      ASSERT_EQ(std::make_tuple(s.arrival.lat(), s.arrival.lng(), s.requested_destination.lat(),
+                                s.requested_destination.lng(), s.pass), metadata[i]);
+      ASSERT_EQ(snapshot_values(snapshots[i]), values[i]);
+      ASSERT_EQ(snapshots[i].origin_edge.SerializeAsString(), origins[i]);
+    }
+  }
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
