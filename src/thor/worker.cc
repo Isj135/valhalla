@@ -1,6 +1,10 @@
 #include "thor/worker.h"
 #include "midgard/logging.h"
 #include "thor/isochrone.h"
+#include "midgard/util.h"
+#include "tyr/actor.h"
+
+#include <optional>
 
 #include <boost/property_tree/ptree.hpp>
 
@@ -71,7 +75,8 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       allow_hierarchy_limits_modifications(
           config.get<bool>("service_limits.hierarchy_limits.allow_modification", false)),
       min_linear_cost_factor(config.get<double>("service_limits.min_linear_cost_factor", 1.0)),
-      max_linear_cost_edges(config.get<uint64_t>("service_limits.max_linear_cost_edges", 50000)) {
+      max_linear_cost_edges(config.get<uint64_t>("service_limits.max_linear_cost_edges", 50000)),
+      confirmation_config_(config) {
 
   // Select the matrix algorithm based on the conf file (defaults to
   // select_optimal if not present)
@@ -119,6 +124,98 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
 thor_worker_t::~thor_worker_t() {
 }
 
+thor_worker_t::CustodiedArrivalResult thor_worker_t::route_with_custodied_arrival(
+    Api& request, const std::function<void()>& interrupt_function) {
+  CustodiedArrivalResult result;
+  const auto& options = request.options();
+  const bool eligible =
+      confirmation_config_.get<bool>("thor.experimental_custodied_arrival", false) &&
+      options.action() == Options::route && options.costing_type() == Costing::auto_ &&
+      options.locations_size() == 2 && options.alternates() == 0 &&
+      options.date_time_type() == Options::depart_at && !options.date_time().empty() &&
+      options.locations(0).date_time() == options.date_time();
+  if (!eligible) {
+    route(request);
+    return result;
+  }
+
+  // Capture options before either ordinary pass mutates correlations or costing state.
+  const Options original = options;
+  if (timedep_forward.HasExperimentalChainObserver())
+    throw valhalla_exception_t{499, "Custodied arrival: observer already owned"};
+
+  std::optional<TimeDepForward::ExperimentalChainSnapshot> snapshot;
+  unsigned publications = 0;
+  bool interrupted = false;
+  const std::function<void()> checked_interrupt = [&]() {
+    try {
+      if (interrupt_function)
+        interrupt_function();
+    } catch (...) {
+      interrupted = true;
+      throw;
+    }
+  };
+  const auto* previous_interrupt = interrupt;
+  auto restore = make_finally([&]() {
+    timedep_forward.SetExperimentalChainObserver({});
+    set_interrupt(previous_interrupt);
+  });
+  timedep_forward.SetExperimentalChainObserver(
+      [&](TimeDepForward::ExperimentalChainSnapshot&& value) {
+        ++publications;
+        if (publications == 1)
+          snapshot = std::move(value);
+      });
+  set_interrupt(&checked_interrupt);
+  checked_interrupt();
+  try {
+    route(request);
+    checked_interrupt();
+    return result;
+  } catch (const valhalla_exception_t& error) {
+    // Only this original Thor route can open the single confirmation.
+    if (error.code != 442 || interrupted || publications != 1 || !snapshot)
+      throw;
+  }
+
+  checked_interrupt();
+  result.ordinary = false;
+  result.custody_labels = static_cast<uint32_t>(snapshot->steps.size());
+  result.candidate = snapshot->arrival;
+  result.confirmation.mutable_options()->CopyFrom(original);
+  auto* confirmation_options = result.confirmation.mutable_options();
+  for (auto& location : *confirmation_options->mutable_locations())
+    location.clear_correlation(); // Let ordinary Loki correlate anew, without relaxed edges.
+  auto* arrival = confirmation_options->mutable_locations(1);
+  arrival->mutable_ll()->set_lat(result.candidate.lat());
+  arrival->mutable_ll()->set_lng(result.candidate.lng());
+  arrival->clear_heading();
+  arrival->clear_heading_tolerance();
+  arrival->clear_name();
+  arrival->clear_street();
+  arrival->clear_display_ll();
+  arrival->clear_date_time();
+  arrival->clear_time_zone_name();
+  arrival->clear_time_zone_offset();
+
+  // Keep location closure filters; reparse AUTO false using its ordinary default.
+  for (auto& costing : *confirmation_options->mutable_costings()) {
+    if (costing.second.type() == Costing::auto_ &&
+        costing.second.options().has_ignore_closures_case() &&
+        !costing.second.options().ignore_closures())
+      costing.second.mutable_options()->clear_ignore_closures();
+  }
+
+  // Fresh actor owns fresh workers/costing. Its Thor observer remains OFF.
+  tyr::actor_t confirmation_actor(confirmation_config_, true);
+  checked_interrupt();
+  result.confirmation_attempts = 1;
+  result.response = confirmation_actor.route("", &checked_interrupt, &result.confirmation);
+  checked_interrupt();
+  return result;
+}
+
 #ifdef ENABLE_SERVICES
 prime_server::worker_t::result_t
 thor_worker_t::work(const std::list<zmq::message_t>& job,
@@ -156,8 +253,12 @@ thor_worker_t::work(const std::list<zmq::message_t>& job,
         result = to_response(isochrones(request), info, request);
         break;
       case Options::route: {
-        route(request);
-        result.messages.emplace_back(serialize_to_pbf(request));
+        auto arrival = route_with_custodied_arrival(request, interrupt_function);
+        if (arrival.ordinary)
+          result.messages.emplace_back(serialize_to_pbf(request));
+        else
+          // actor.route already ran Odin and serialized once; return its bytes directly.
+          result = to_response(arrival.response, info, request);
         break;
       }
       case Options::trace_route: {

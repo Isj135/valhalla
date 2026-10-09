@@ -4,6 +4,9 @@
 #include "test.h"
 #include "thor/unidirectional_astar.h"
 #include "thor/worker.h"
+#include "odin/worker.h"
+#include "midgard/util.h"
+#include "midgard/encoded.h"
 #include "worker.h"
 
 #include <boost/property_tree/json_parser.hpp>
@@ -773,6 +776,158 @@ TEST(TorinoCustody, DISABLED_PapacinoFrozenCases) {
       ASSERT_EQ(snapshot_values(snapshots[i]), values[i]);
       ASSERT_EQ(snapshots[i].origin_edge.SerializeAsString(), origins[i]);
     }
+  }
+}
+
+
+// Frozen before implementation: original Papacino at 06:30/11:00 succeeds with
+// zero confirmations; 10:01 fails with 442, yields 94 labels, and confirms once.
+// This traverses real Loki + Thor and the same helper used by HTTP work().
+// It does not certify HTTP transport, Lumo adoption/panel or Android/iOS.
+class PapacinoConfirmationWorker : public thor_worker_t {
+public:
+  using thor_worker_t::thor_worker_t;
+  bool observing() const { return timedep_forward.HasExperimentalChainObserver(); }
+  void track(const PathAlgorithm::expansion_callback_t& callback) {
+    timedep_forward.set_track_expansion(callback);
+  }
+};
+
+TEST(PapacinoConfirmation, DISABLED_FrozenCasesAndNextRequest) {
+  boost::property_tree::ptree config;
+  boost::property_tree::read_json(
+      "C:/Users/renat/Documents/Lumoflutter/valhalla_phase2a_bench/valhalla.json", config);
+  for (const auto* key : {"tile_extract", "traffic_extract", "tile_url", "incident_log",
+                          "incident_tile_dir", "landmarks"})
+    config.get_child("mjolnir").erase(key);
+  config.put("logging.type", "std_out");
+  config.get_child("logging").erase("file_name");
+  ASSERT_FALSE(config.get<bool>("thor.experimental_custodied_arrival", false));
+  auto enabled = config;
+  enabled.put("thor.experimental_custodied_arrival", true);
+  auto off_reader = std::make_shared<GraphReader>(config.get_child("mjolnir"));
+  auto on_reader = std::make_shared<GraphReader>(config.get_child("mjolnir"));
+  PapacinoConfirmationWorker off(config, off_reader), on(enabled, on_reader);
+  const std::function<void()> interrupt_function = []() {};
+  using Event = std::tuple<uint64_t, uint64_t, std::string, int, float,
+                           uint32_t, float, int, uint8_t, int>;
+  auto track = [](std::vector<Event>& events) {
+    return [&events](GraphReader&, const GraphId& edge, const GraphId& predecessor,
+                     const char* name, Expansion_EdgeStatus status, float seconds,
+                     uint32_t distance, float cost, Expansion_ExpansionType direction,
+                     uint8_t flow, valhalla::TravelMode mode) {
+      events.emplace_back(edge.value, predecessor.value, std::string(name), int(status),
+                          seconds, distance, cost, int(direction), flow, int(mode));
+    };
+  };
+  // Failure first, then successes on the same worker: catches stale custody.
+  for (const auto* time : {"10:01", "06:30", "11:00"}) {
+    SCOPED_TRACE(time);
+    const bool alternative = std::string(time) == "10:01";
+    const std::string input =
+        std::string(R"({"locations":[{"lat":45.0673126,"lon":7.7012488},{"lat":45.0687289,"lon":7.6720592}],"costing":"auto","costing_options":{"auto":{}},"date_time":{"type":1,"value":"2026-10-08T)") +
+        time + R"("},"language":"it-IT","units":"kilometers","shape_format":"polyline6"})";
+    Api correlated;
+    ParseApi(input, Options::route, correlated);
+    loki_worker_t loki(config, off_reader);
+    loki.route(correlated);
+    loki.cleanup();
+    const auto original = correlated.options();
+    Api off_api = correlated, on_api = correlated;
+    std::vector<Event> off_events, on_events;
+    auto detach = make_finally([&]() {
+      off.track({}); on.track({});
+      off.cleanup(); on.cleanup();
+      off.set_interrupt(nullptr); on.set_interrupt(nullptr);
+    });
+    off.track(track(off_events)); on.track(track(on_events));
+    off.set_interrupt(&interrupt_function); on.set_interrupt(&interrupt_function);
+    unsigned off_code = 0;
+    try {
+      const auto ordinary = off.route_with_custodied_arrival(off_api, interrupt_function);
+      ASSERT_TRUE(ordinary.ordinary);
+      ASSERT_EQ(ordinary.confirmation_attempts, 0);
+    } catch (const valhalla_exception_t& error) {
+      off_code = error.code;
+    }
+    ASSERT_EQ(off_code, alternative ? 442u : 0u);
+    auto actual = on.route_with_custodied_arrival(on_api, interrupt_function);
+    ASSERT_EQ(actual.ordinary, !alternative);
+    ASSERT_EQ(actual.confirmation_attempts, alternative ? 1u : 0u);
+    ASSERT_EQ(off_events, on_events); // Original route only: fresh actor is unobserved.
+    ASSERT_EQ(off_api.options().SerializeAsString(), on_api.options().SerializeAsString());
+    ASSERT_EQ(off_api.trip().SerializeAsString(), on_api.trip().SerializeAsString());
+    ASSERT_EQ(off_api.info().warnings_size(), on_api.info().warnings_size());
+    for (int i = 0; i < off_api.info().warnings_size(); ++i)
+      ASSERT_EQ(off_api.info().warnings(i).SerializeAsString(),
+                on_api.info().warnings(i).SerializeAsString());
+    ASSERT_FALSE(on.observing());
+    ASSERT_FALSE(off.observing());
+    ASSERT_DOUBLE_EQ(on_api.options().locations(1).ll().lat(), 45.0687289);
+    ASSERT_DOUBLE_EQ(on_api.options().locations(1).ll().lng(), 7.6720592);
+    if (alternative) {
+      ASSERT_EQ(actual.custody_labels, 94);
+      ASSERT_NEAR(actual.candidate.lat(), 45.0678875, 1e-7);
+      ASSERT_NEAR(actual.candidate.lng(), 7.672596100000001, 1e-7);
+      const auto& confirmed = actual.confirmation;
+      ASSERT_EQ(confirmed.options().costing_type(), original.costing_type());
+      ASSERT_EQ(confirmed.options().date_time_type(), original.date_time_type());
+      ASSERT_EQ(confirmed.options().date_time(), original.date_time());
+      ASSERT_EQ(confirmed.options().costings().size(), original.costings().size());
+      for (const auto& costing : original.costings()) {
+        const auto found = confirmed.options().costings().find(costing.first);
+        ASSERT_NE(found, confirmed.options().costings().end());
+        ASSERT_EQ(found->second.SerializeAsString(), costing.second.SerializeAsString());
+      }
+      ASSERT_DOUBLE_EQ(confirmed.options().locations(0).ll().lat(), original.locations(0).ll().lat());
+      ASSERT_DOUBLE_EQ(confirmed.options().locations(0).ll().lng(), original.locations(0).ll().lng());
+      ASSERT_DOUBLE_EQ(confirmed.options().locations(1).ll().lat(), actual.candidate.lat());
+      ASSERT_DOUBLE_EQ(confirmed.options().locations(1).ll().lng(), actual.candidate.lng());
+      ASSERT_EQ(confirmed.trip().routes_size(), 1);
+      ASSERT_EQ(confirmed.trip().routes(0).legs_size(), 1);
+      const auto shape =
+          midgard::decode<std::vector<PointLL>>(confirmed.trip().routes(0).legs(0).shape());
+      ASSERT_GE(shape.size(), 2);
+      // One polyline6 unit: representation precision, not an arrival search radius.
+      ASSERT_NEAR(shape.back().lat(), actual.candidate.lat(), 1e-6);
+      ASSERT_NEAR(shape.back().lng(), actual.candidate.lng(), 1e-6);
+      ASSERT_EQ(confirmed.options().locations(0).date_time(), original.date_time());
+      ASSERT_EQ(confirmed.options().locations(0).time_zone_name(), "Europe/Rome");
+      const PointLL destination{7.6720592, 45.0687289};
+      const auto residual = shape.back().Distance(destination);
+      rapidjson::Document body;
+      body.Parse(actual.response.c_str());
+      ASSERT_FALSE(body.HasParseError());
+      ASSERT_TRUE(body.IsObject());
+      ASSERT_TRUE(body.HasMember("trip"));
+      ASSERT_TRUE(body["trip"].IsObject());
+      ASSERT_TRUE(body["trip"].HasMember("status"));
+      ASSERT_TRUE(body["trip"]["status"].IsInt());
+      ASSERT_EQ(body["trip"]["status"].GetInt(), 0);
+      ASSERT_TRUE(body["trip"].HasMember("summary"));
+      ASSERT_TRUE(body["trip"]["summary"].IsObject());
+      ASSERT_TRUE(body["trip"]["summary"].HasMember("length"));
+      ASSERT_TRUE(body["trip"]["summary"]["length"].IsNumber());
+      ASSERT_TRUE(body["trip"]["summary"].HasMember("time"));
+      ASSERT_TRUE(body["trip"]["summary"]["time"].IsNumber());
+      ASSERT_GT(body["trip"]["summary"]["length"].GetDouble(), 0);
+      ASSERT_GT(body["trip"]["summary"]["time"].GetDouble(), 0);
+      std::cout << "PAPACINO_CONFIRMATION " << time << " count=1 labels="
+                << actual.custody_labels << " length_km="
+                << body["trip"]["summary"]["length"].GetDouble() << " seconds="
+                << body["trip"]["summary"]["time"].GetDouble()
+                << " residual_m=" << residual << std::endl;
+    } else {
+      ASSERT_EQ(actual.custody_labels, 0);
+      ASSERT_TRUE(actual.response.empty());
+      odin::odin_worker_t off_odin(config), on_odin(config);
+      ASSERT_EQ(off_odin.narrate(off_api), on_odin.narrate(on_api));
+    }
+    off.track({}); on.track({});
+    off.cleanup(); on.cleanup();
+    ASSERT_FALSE(on.observing());
+    off.set_interrupt(nullptr); on.set_interrupt(nullptr);
+    ASSERT_FALSE(HasFailure());
   }
 }
 

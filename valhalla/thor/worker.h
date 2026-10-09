@@ -20,7 +20,7 @@
 #include <valhalla/thor/unidirectional_astar.h>
 #include <valhalla/worker.h>
 
-#include <boost/property_tree/ptree_fwd.hpp>
+#include <boost/property_tree/ptree.hpp>
 
 #include <tuple>
 #include <vector>
@@ -52,6 +52,18 @@ public:
   static void adjust_locations(valhalla::Api& options);
 
   void route(Api& request);
+
+  // Isolated opt-in: ordinary success has priority; at most one confirmation.
+  struct CustodiedArrivalResult {
+    bool ordinary = true;
+    uint32_t confirmation_attempts = 0;
+    uint32_t custody_labels = 0;
+    midgard::PointLL candidate;
+    Api confirmation;
+    std::string response;
+  };
+  CustodiedArrivalResult route_with_custodied_arrival(
+      Api& request, const std::function<void()>& interrupt_function);
   std::string matrix(Api& request);
   void optimized_route(Api& request);
   std::string isochrones(Api& request);
@@ -144,6 +156,7 @@ protected:
   uint64_t max_linear_cost_edges;
 
 private:
+  const boost::property_tree::ptree confirmation_config_;
   std::string service_name() const override {
     return "thor";
   }
